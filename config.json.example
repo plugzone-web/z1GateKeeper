@@ -52,6 +52,15 @@
         "wc",
         "echo"
     ],
+    "blacklist": [
+        "nano",
+        "vim",
+        "vi",
+        "emacs",
+        "nano",
+        "edit",
+        "ed"
+    ],
     "screen": {
         "enabled": false,
         "sessionName": "IA_BATCH_WORKSPACE"

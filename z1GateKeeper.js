@@ -10,6 +10,7 @@ const readline = require('readline');
 const axios = require('axios');
 const { createWriteStream } = require('fs');
 const createStateManager = require('./lib/stateManager');
+const { filterAnsiControlSequences } = require('./lib/ansi-filter');
 
 // --- Configuração Global ---
 let CONFIG;
@@ -76,6 +77,11 @@ function validateConfig(config) {
         throw new Error('Whitelist deve ser um array não vazio');
     }
 
+    // Blacklist is optional
+    if (config.blacklist && !Array.isArray(config.blacklist)) {
+        throw new Error('Blacklist deve ser um array se fornecida');
+    }
+
     if (config.destination.privateKey && !fs.existsSync(config.destination.privateKey)) {
         throw new Error(`Chave privada de destino não encontrada: ${config.destination.privateKey}`);
     }
@@ -124,6 +130,25 @@ function isWhitelisted(command) {
     const trimmed = command.trim();
     for (const allowed of CONFIG.whitelist) {
         const escaped = escapeRegex(allowed);
+        // Match exato ou com argumentos
+        const regex = new RegExp(`^${escaped}(\\s|$|\\s+.*)`);
+        if (regex.test(trimmed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Verifica se um comando está na blacklist (comandos proibidos)
+ */
+function isBlacklisted(command) {
+    if (!CONFIG.blacklist || !Array.isArray(CONFIG.blacklist)) {
+        return false;
+    }
+    const trimmed = command.trim();
+    for (const blocked of CONFIG.blacklist) {
+        const escaped = escapeRegex(blocked);
         // Match exato ou com argumentos
         const regex = new RegExp(`^${escaped}(\\s|$|\\s+.*)`);
         if (regex.test(trimmed)) {
@@ -222,37 +247,32 @@ Analise a intenção geral, identifique riscos potenciais (destruição de dados
 
 /**
  * Processa comandos em buffer, incluindo multi-linha e pipes
+ * Retorna o comando parseado completo (incluindo todos os comandos separados por ;)
+ * e indica se tinha quebra de linha
  */
 function parseCommand(data) {
     const str = data.toString();
+    const hasNewline = str.includes('\n') || str.includes('\r');
+    
+    // Normalizar quebras de linha para \n (Linux)
+    const normalized = str.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
     
     // Se contém quebra de linha, é um comando completo
-    if (str.includes('\n') || str.includes('\r')) {
+    if (hasNewline) {
         // Remove quebras de linha e processa
-        const cleaned = str.replace(/[\r\n]+/g, '').trim();
+        const cleaned = normalized.replace(/\n/g, '').trim();
         if (!cleaned) return null;
         
-        // Se tem ponto-e-vírgula, separa comandos
-        if (cleaned.includes(';')) {
-            const commands = cleaned.split(';').map(c => c.trim()).filter(c => c);
-            return commands.length > 0 ? commands[0] : cleaned;
-        }
-        
-        return cleaned;
+        // Retornar o comando completo (incluindo ; se houver)
+        return { command: cleaned, hasNewline: true };
     }
     
     // Sem quebra de linha - pode ser parte de um comando ou comando completo com ;
-    const trimmed = str.trim();
+    const trimmed = normalized.trim();
     if (!trimmed) return null;
     
-    // Se tem ponto-e-vírgula, separa
-    if (trimmed.includes(';')) {
-        const commands = trimmed.split(';').map(c => c.trim()).filter(c => c);
-        return commands.length > 0 ? commands[0] : trimmed;
-    }
-    
-    // Comando único sem quebra de linha - retorna como está
-    return trimmed;
+    // Retornar o comando completo (incluindo ; se houver)
+    return { command: trimmed, hasNewline: false };
 }
 
 /**
@@ -358,11 +378,26 @@ function handleSession(session, clientInfo) {
                     }
 
                     const comandoRaw = data.toString();
-                    const comando = parseCommand(data);
+                    const parsed = parseCommand(data);
 
-                    if (!comando) {
+                    if (!parsed || !parsed.command) {
                         // Enviar dados não-comando diretamente (teclas especiais, etc)
                         return realStream.write(data);
+                    }
+
+                    const comando = parsed.command;
+                    const hasNewline = parsed.hasNewline;
+
+                    // Verificar blacklist ANTES de qualquer outro processamento
+                    if (isBlacklisted(comando)) {
+                        stream.write(`\r\n[z1GateKeeper] ❌ Comando proibido: ${comando}\r\n`);
+                        stream.write(`[z1GateKeeper] Este comando não pode ser executado por questões de compatibilidade.\r\n`);
+                        logAudit('COMMAND_BLOCKED', `Comando proibido: ${comando}`, { 
+                            sessionId, 
+                            username: clientInfo.username 
+                        });
+                        // NÃO envia o data original (que contém o Enter) - isso evita linhas vazias
+                        return;
                     }
 
                     // Comando EXIT - encerrar conexão
@@ -396,7 +431,9 @@ function handleSession(session, clientInfo) {
                             sessionId, 
                             username: clientInfo.username 
                         });
-                        return realStream.write(data);
+                        // Normalizar quebra de linha para \n (Linux) antes de enviar
+                        const normalizedData = Buffer.from(data.toString().replace(/\r\n/g, '\n').replace(/\r/g, '\n'));
+                        return realStream.write(normalizedData);
                     }
 
                     // Comando sensível detectado
@@ -503,7 +540,10 @@ ${'='.repeat(60)}
                                     });
                                     
                                     // Enviar comandos aprovados
-                                    commandsToExecute.forEach(c => {
+                                    // O raw já foi normalizado para \n (Linux) quando foi salvo
+                                    // Cada comando no buffer já está separado (se tinha ;, foi separado ao adicionar)
+                                    commandsToExecute.forEach((c, index) => {
+                                        // Cada comando já está separado e normalizado - apenas executar
                                         realStream.write(c.raw);
                                         logAudit('COMMAND_EXECUTED', `Comando executado: ${c.cmd}`, { 
                                             sessionId, 
@@ -558,26 +598,59 @@ ${'='.repeat(60)}
                         }
                     } else {
                         // Adicionar ao buffer
-                        bufferComandos.push({ 
-                            cmd: comando, 
-                            raw: data,
-                            timestamp: Date.now()
-                        });
+                        // IMPORTANTE: NÃO enviar o data original (que contém o Enter) ao servidor
+                        // Isso evita linhas vazias no terminal
+                        
+                        // Se o comando tem ;, separar e adicionar cada um ao buffer
+                        if (comando.includes(';')) {
+                            const parts = comando.split(';').map(p => p.trim()).filter(p => p);
+                            parts.forEach(part => {
+                                const normalizedCmd = part + '\n'; // Normalizar para \n (Linux)
+                                bufferComandos.push({ 
+                                    cmd: part, 
+                                    raw: Buffer.from(normalizedCmd), // Salvar com quebra de linha normalizada
+                                    timestamp: Date.now()
+                                });
+                                // Show each command in yellow to indicate it's queued
+                                stream.write(`\x1b[33m[QUEUED]\x1b[0m ${part}\r\n`);
+                            });
+                        } else {
+                            // Comando único
+                            const normalizedCmd = comando + '\n'; // Normalizar para \n (Linux)
+                            bufferComandos.push({ 
+                                cmd: comando, 
+                                raw: Buffer.from(normalizedCmd), // Salvar com quebra de linha normalizada
+                                timestamp: Date.now()
+                            });
+                            // Show command in yellow to indicate it's queued
+                            stream.write(`\x1b[33m[QUEUED]\x1b[0m ${comando}\r\n`);
+                        }
+                        
                         stateManager.updateConnection(sessionId, { bufferComandos });
-                        // Show command in yellow to indicate it's queued
-                        stream.write(`\x1b[33m[QUEUED]\x1b[0m ${comando}\r\n`);
-                        logAudit('COMMAND_QUEUED', `Comando em fila: ${comando}`, { 
+                        logAudit('COMMAND_QUEUED', `Comando(s) em fila: ${comando}`, { 
                             sessionId, 
                             queueSize: bufferComandos.length 
                         });
+                        // NÃO enviar o data original - isso previne o Enter de chegar ao servidor
                     }
                 });
 
                 // Proxy de dados do servidor remoto para o cliente
                 realStream.on('data', (data) => {
-                    stream.write(data);
-                    // Store terminal output for web interface
-                    stateManager.appendTerminalOutput(sessionId, data);
+                    // Filtrar sequências ANSI de controle antes de enviar ao cliente
+                    // Isso evita que sequências OSC apareçam como texto no terminal
+                    let filteredData = data;
+                    const dataStr = data.toString();
+                    const filteredStr = filterAnsiControlSequences(dataStr);
+                    
+                    // Se houve filtragem, criar novo buffer
+                    if (filteredStr !== dataStr) {
+                        filteredData = Buffer.from(filteredStr);
+                    }
+                    
+                    stream.write(filteredData);
+                    // Store terminal output for web interface (já filtrado pelo stateManager)
+                    stateManager.appendTerminalOutput(sessionId, filteredData);
                 });
 
                 realStream.on('close', () => {

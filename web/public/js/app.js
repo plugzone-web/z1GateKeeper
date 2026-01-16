@@ -176,12 +176,9 @@ function updateActiveConnections(connections) {
                 ` : ''}
             </div>
             <div class="connection-terminal">
-                <div class="terminal-preview" id="terminal-preview-${conn.sessionId}">
+                <div class="terminal-preview clickable" id="terminal-preview-${conn.sessionId}" onclick="openTerminalFullscreen('${conn.sessionId}')" title="Clique para abrir em tela cheia">
                     <div class="terminal-preview-content"></div>
                 </div>
-                <button class="btn btn-secondary btn-fullscreen" onclick="openTerminalFullscreen('${conn.sessionId}')">
-                    📺 Ver Terminal (Tela Cheia)
-                </button>
             </div>
         </div>
     `).join('');
@@ -291,7 +288,7 @@ async function approveTicket(ticketId, approved) {
         const result = await response.json();
         
         if (result.success) {
-            // Update button states - keep disabled
+            // Update button states - keep disabled and show status
             if (approveBtn) {
                 approveBtn.textContent = approved ? '✅ Aprovado' : '✅ Aprovar';
             }
@@ -299,8 +296,17 @@ async function approveTicket(ticketId, approved) {
                 rejectBtn.textContent = approved ? '❌ Rejeitar' : '❌ Rejeitado';
             }
             
-            // Reload dashboard after a short delay
-            setTimeout(() => loadDashboard(), 1000);
+            // Hide ticket after processing (it will be removed from pending list)
+            const ticketEl = document.querySelector(`[data-ticket-id="${ticketId}"]`);
+            if (ticketEl) {
+                ticketEl.style.opacity = '0.5';
+                ticketEl.style.pointerEvents = 'none';
+            }
+            
+            // Reload dashboard after delay to remove processed ticket
+            setTimeout(() => {
+                loadDashboard();
+            }, 1500);
         } else {
             alert('Erro ao processar ticket: ' + result.message);
             // Re-enable buttons on error
@@ -383,14 +389,17 @@ function updateTerminalPreview(sessionId, output) {
             if (output && output.trim().length > 0) {
                 const lines = output.split('\n').filter(line => line.trim().length > 0);
                 const lastLines = lines.slice(-3).join('\n'); // Last 3 non-empty lines
-                content.textContent = lastLines || output.slice(-100); // Fallback to last 100 chars
+                const displayText = lastLines || output.slice(-100); // Fallback to last 100 chars
+                
+                // Parse ANSI codes to HTML
+                content.innerHTML = parseAnsiToHtml(displayText);
             } else {
-                content.textContent = '...'; // Show something to indicate it's working
+                content.innerHTML = '<span style="color: #888;">...</span>'; // Show something to indicate it's working
             }
             
             // Always ensure content is visible
-            if (content.textContent.trim().length === 0) {
-                content.textContent = '...';
+            if (!content.textContent || content.textContent.trim().length === 0) {
+                content.innerHTML = '<span style="color: #888;">...</span>';
             }
         }
     }
@@ -399,7 +408,8 @@ function updateTerminalPreview(sessionId, output) {
 function updateTerminalDisplay(sessionId, output) {
     const display = document.getElementById('terminal-display');
     if (display && display.dataset.sessionId === sessionId) {
-        display.textContent = output;
+        // Parse ANSI codes for fullscreen display too
+        display.innerHTML = parseAnsiToHtml(output);
         display.scrollTop = display.scrollHeight;
     }
     
@@ -416,7 +426,8 @@ function openTerminalFullscreen(sessionId) {
         const sub = terminalSubscriptions.get(sessionId);
         if (sub) {
             display.dataset.sessionId = sessionId;
-            display.textContent = sub.output || '';
+            // Parse ANSI codes for fullscreen
+            display.innerHTML = parseAnsiToHtml(sub.output || '');
             sessionIdEl.textContent = `Terminal: ${sessionId}`;
             modal.style.display = 'flex';
             display.scrollTop = display.scrollHeight;
