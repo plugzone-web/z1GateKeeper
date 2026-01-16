@@ -1,6 +1,25 @@
 {
+  "name": "z1gatekeeper",
+  "version": "2.0.0",
+  "description": "SSH Proxy de Governança para Agentes de IA",
+  "main": "z1GateKeeper.js",
+  "scripts": {
+    "start": "node z1GateKeeper.js"
+  },
   "dependencies": {
     "axios": "^1.13.2",
-    "ssh2": "^1.17.0"
-  }
+    "ssh2": "^1.17.0",
+    "express": "^4.18.2",
+    "socket.io": "^4.6.1",
+    "better-sqlite3": "^9.2.2"
+  },
+  "keywords": [
+    "ssh",
+    "proxy",
+    "ai",
+    "security",
+    "gatekeeper"
+  ],
+  "author": "André Rutz Porto <andre@plugzone.com.br>",
+  "license": "AGPL-3.0"
 }

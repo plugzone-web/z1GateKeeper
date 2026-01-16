@@ -9,12 +9,14 @@ const path = require('path');
 const readline = require('readline');
 const axios = require('axios');
 const { createWriteStream } = require('fs');
+const createStateManager = require('./lib/stateManager');
 
 // --- Configuração Global ---
 let CONFIG;
 let auditLogStream;
-let activeConnections = new Map();
 let isShuttingDown = false;
+let ticketApprovalCallbacks = new Map(); // ticketId -> callback function
+let stateManager;
 
 // --- Inicialização ---
 function initialize() {
@@ -27,6 +29,11 @@ function initialize() {
         console.error(`[FATAL] Erro ao carregar configuração: ${error.message}`);
         process.exit(1);
     }
+
+    // Initialize state manager with database
+    const dbPath = CONFIG.database?.path || './data/z1gatekeeper.db';
+    stateManager = createStateManager(dbPath);
+    log('INFO', `Database inicializado: ${dbPath}`);
 
     // Inicializar audit log
     if (CONFIG.auditLog && CONFIG.auditLog.enabled) {
@@ -218,13 +225,34 @@ Analise a intenção geral, identifique riscos potenciais (destruição de dados
  */
 function parseCommand(data) {
     const str = data.toString();
-    // Remove caracteres de controle e quebras de linha
-    const cleaned = str.replace(/[\r\n]+/g, ' ').trim();
-    if (!cleaned) return null;
-
-    // Separa comandos por pipes ou ponto-e-vírgula
-    const commands = cleaned.split(/[|;]/).map(c => c.trim()).filter(c => c);
-    return commands.length > 0 ? commands[0] : cleaned; // Retorna o primeiro comando para análise
+    
+    // Se contém quebra de linha, é um comando completo
+    if (str.includes('\n') || str.includes('\r')) {
+        // Remove quebras de linha e processa
+        const cleaned = str.replace(/[\r\n]+/g, '').trim();
+        if (!cleaned) return null;
+        
+        // Se tem ponto-e-vírgula, separa comandos
+        if (cleaned.includes(';')) {
+            const commands = cleaned.split(';').map(c => c.trim()).filter(c => c);
+            return commands.length > 0 ? commands[0] : cleaned;
+        }
+        
+        return cleaned;
+    }
+    
+    // Sem quebra de linha - pode ser parte de um comando ou comando completo com ;
+    const trimmed = str.trim();
+    if (!trimmed) return null;
+    
+    // Se tem ponto-e-vírgula, separa
+    if (trimmed.includes(';')) {
+        const commands = trimmed.split(';').map(c => c.trim()).filter(c => c);
+        return commands.length > 0 ? commands[0] : trimmed;
+    }
+    
+    // Comando único sem quebra de linha - retorna como está
+    return trimmed;
 }
 
 /**
@@ -245,11 +273,15 @@ function handleSession(session, clientInfo) {
         isNHI: isNHIUser
     });
 
-    activeConnections.set(sessionId, {
+    // Store in state manager
+    stateManager.addConnection(sessionId, {
         username: clientInfo.username,
         ip: clientInfo.ip,
         startTime: connectionStartTime,
-        isNHI: isNHIUser
+        isNHI: isNHIUser,
+        bufferComandos: [],
+        emModoBloqueio: false,
+        historicoLeitura: []
     });
 
     session.on('shell', (accept) => {
@@ -291,22 +323,38 @@ function handleSession(session, clientInfo) {
 
                 realStream = streamReal;
 
-                // Inicializar screen session
-                const screenSession = CONFIG.screen?.sessionName || 'IA_BATCH_WORKSPACE';
-                const screenCmd = `screen -R -S ${screenSession} || screen -S ${screenSession}\n`;
+                // Inicializar screen session (se habilitado)
+                const screenEnabled = CONFIG.screen?.enabled !== false; // Default: true for backward compatibility
                 
-                // Aguardar um pouco antes de enviar comando screen
-                setTimeout(() => {
-                    realStream.write(screenCmd);
+                if (screenEnabled) {
+                    const screenSession = CONFIG.screen?.sessionName || 'IA_BATCH_WORKSPACE';
+                    const screenCmd = `screen -R -S ${screenSession} || screen -S ${screenSession}\n`;
+                    
+                    // Aguardar um pouco antes de enviar comando screen
+                    setTimeout(() => {
+                        realStream.write(screenCmd);
+                        screenInitialized = true;
+                        log('INFO', `Screen session inicializada: ${screenSession}`, { sessionId });
+                    }, 500);
+                } else {
+                    // Screen desabilitado - marcar como inicializado imediatamente
                     screenInitialized = true;
-                    log('INFO', `Screen session inicializada: ${screenSession}`, { sessionId });
-                }, 500);
+                    log('INFO', `Screen desabilitado - usando shell direto`, { sessionId });
+                }
 
                 // Handler de dados do cliente
                 stream.on('data', async (data) => {
                     if (!realStream || !screenInitialized) {
-                        // Buffer temporário se screen ainda não inicializou
+                        // Buffer temporário se screen ainda não inicializou (apenas quando screen está habilitado)
                         return;
+                    }
+
+                    // Sync local state with stateManager (for web interface visibility)
+                    const connection = stateManager.getConnection(sessionId);
+                    if (connection) {
+                        bufferComandos = connection.bufferComandos || bufferComandos;
+                        emModoBloqueio = connection.emModoBloqueio || emModoBloqueio;
+                        historicoLeitura = connection.historicoLeitura || historicoLeitura;
                     }
 
                     const comandoRaw = data.toString();
@@ -317,9 +365,33 @@ function handleSession(session, clientInfo) {
                         return realStream.write(data);
                     }
 
+                    // Comando EXIT - encerrar conexão
+                    if (comando.toUpperCase().trim() === 'EXIT' || comando.toUpperCase().trim() === 'QUIT') {
+                        stream.write(`\r\n[z1GateKeeper] Encerrando conexão...\r\n`);
+                        logAudit('EXIT_COMMAND', `Comando EXIT recebido`, { 
+                            sessionId, 
+                            username: clientInfo.username 
+                        });
+                        
+                        // Close connection gracefully
+                        setTimeout(() => {
+                            stream.write('[z1GateKeeper] Conexão encerrada pelo usuário.\r\n');
+                            stream.end();
+                            if (realStream) {
+                                realStream.end();
+                            }
+                            if (connReal) {
+                                connReal.end();
+                            }
+                            stateManager.removeConnection(sessionId);
+                        }, 100);
+                        return;
+                    }
+
                     // Verificar se está na whitelist
                     if (isWhitelisted(comando) && !emModoBloqueio) {
                         historicoLeitura.push(comando);
+                        stateManager.updateConnection(sessionId, { historicoLeitura });
                         logAudit('COMMAND_ALLOWED', `Comando permitido: ${comando}`, { 
                             sessionId, 
                             username: clientInfo.username 
@@ -330,9 +402,11 @@ function handleSession(session, clientInfo) {
                     // Comando sensível detectado
                     if (!emModoBloqueio) {
                         emModoBloqueio = true;
+                        // Send visual indication
                         const msg = `\r\n[z1GateKeeper] ⚠️  Comando sensível detectado. Entrando em modo BATCH AUDIT.\r\n` +
                                    `[z1GateKeeper] Envie 'SUBMIT' para solicitar revisão humana.\r\n`;
                         stream.write(msg);
+                        stateManager.updateConnection(sessionId, { emModoBloqueio: true });
                         logAudit('BATCH_MODE_ENTERED', `Modo bloqueio ativado`, { 
                             sessionId, 
                             command: comando,
@@ -347,7 +421,7 @@ function handleSession(session, clientInfo) {
                             return;
                         }
 
-                        stream.write(`[z1GateKeeper] Gerando relatório de auditoria...\r\n`);
+                        stream.write(`\x1b[0m[z1GateKeeper] Gerando relatório de auditoria...\r\n`); // Reset color
                         logAudit('SUBMIT_REQUESTED', `Solicitação de aprovação`, { 
                             sessionId, 
                             commands: bufferComandos.length,
@@ -362,6 +436,30 @@ function handleSession(session, clientInfo) {
                             );
 
                             const ticketId = `TICKET-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
+                            
+                            // Store ticket in state manager
+                            // Process commands: if multiple commands in one line (separated by ;), split them
+                            const processedCommands = bufferComandos.flatMap(c => {
+                                const cmd = c.cmd;
+                                // If command contains ;, split it
+                                if (cmd.includes(';')) {
+                                    return cmd.split(';').map(subCmd => subCmd.trim()).filter(subCmd => subCmd);
+                                }
+                                return [cmd];
+                            });
+                            
+                            const ticket = stateManager.addPendingTicket(ticketId, {
+                                sessionId,
+                                username: clientInfo.username,
+                                ip: clientInfo.ip,
+                                isNHI: isNHIUser,
+                                commands: processedCommands,
+                                commandsRaw: bufferComandos,
+                                historicoLeitura: historicoLeitura.slice(-20),
+                                aiAnalysis: analise,
+                                createdAt: Date.now()
+                            });
+
                             const ticketDisplay = `
 ${'='.repeat(60)}
 TICKET DE OPERAÇÃO - z1GateKeeper
@@ -392,18 +490,20 @@ ${'='.repeat(60)}
                                 commands: bufferComandos.length 
                             });
 
-                            rl.question('\n[z1GateKeeper] Aprovar bloco de comandos? (s/n): ', (answer) => {
-                                const approved = answer.toLowerCase().trim() === 's';
+                            // Store callback for approval
+                            ticketApprovalCallbacks.set(ticketId, (approved) => {
+                                // Capture current buffer before reset
+                                const commandsToExecute = [...bufferComandos];
                                 
                                 if (approved) {
                                     logAudit('TICKET_APPROVED', `Comandos aprovados`, { 
                                         ticketId, 
                                         sessionId,
-                                        commands: bufferComandos.length 
+                                        commands: commandsToExecute.length 
                                     });
                                     
                                     // Enviar comandos aprovados
-                                    bufferComandos.forEach(c => {
+                                    commandsToExecute.forEach(c => {
                                         realStream.write(c.raw);
                                         logAudit('COMMAND_EXECUTED', `Comando executado: ${c.cmd}`, { 
                                             sessionId, 
@@ -411,21 +511,47 @@ ${'='.repeat(60)}
                                         });
                                     });
                                     
-                                    stream.write(`[z1GateKeeper] ✅ Comandos aprovados e enviados (${bufferComandos.length}).\r\n`);
+                                    stream.write(`\x1b[0m[z1GateKeeper] ✅ Comandos aprovados e enviados (${commandsToExecute.length}).\r\n`);
+                                    stateManager.updateTicket(ticketId, { status: 'approved', approvedAt: Date.now() });
                                 } else {
                                     logAudit('TICKET_REJECTED', `Comandos rejeitados`, { 
                                         ticketId, 
                                         sessionId,
-                                        commands: bufferComandos.length 
+                                        commands: commandsToExecute.length 
                                     });
-                                    stream.write(`[z1GateKeeper] ❌ Comandos rejeitados.\r\n`);
+                                    stream.write(`\x1b[0m[z1GateKeeper] ❌ Comandos rejeitados.\r\n`);
+                                    stateManager.updateTicket(ticketId, { status: 'rejected', rejectedAt: Date.now() });
                                 }
 
-                                // Reset
+                                // Reset local variables AND state manager
                                 bufferComandos = [];
                                 emModoBloqueio = false;
                                 historicoLeitura = [];
+                                
+                                stateManager.updateConnection(sessionId, {
+                                    bufferComandos: [],
+                                    emModoBloqueio: false,
+                                    historicoLeitura: []
+                                });
+                                
+                                // Reset color
+                                stream.write(`\x1b[0m\r\n`); // Reset color and newline - prompt will return to normal
+                                
+                                // Remove callback and ticket after delay
+                                setTimeout(() => {
+                                    ticketApprovalCallbacks.delete(ticketId);
+                                    stateManager.removeTicket(ticketId);
+                                }, 5000);
                             });
+
+                            // CLI approval (if web interface not handling it)
+                            if (CONFIG.web && !CONFIG.web.enabled) {
+                                rl.question('\n[z1GateKeeper] Aprovar bloco de comandos? (s/n): ', (answer) => {
+                                    const approved = answer.toLowerCase().trim() === 's';
+                                    const callback = ticketApprovalCallbacks.get(ticketId);
+                                    if (callback) callback(approved);
+                                });
+                            }
                         } catch (error) {
                             logError('TICKET_GENERATION', error);
                             stream.write(`[z1GateKeeper] Erro ao gerar ticket. Revise manualmente.\r\n`);
@@ -437,7 +563,9 @@ ${'='.repeat(60)}
                             raw: data,
                             timestamp: Date.now()
                         });
-                        stream.write(`[QUEUED] ${comando}\r\n`);
+                        stateManager.updateConnection(sessionId, { bufferComandos });
+                        // Show command in yellow to indicate it's queued
+                        stream.write(`\x1b[33m[QUEUED]\x1b[0m ${comando}\r\n`);
                         logAudit('COMMAND_QUEUED', `Comando em fila: ${comando}`, { 
                             sessionId, 
                             queueSize: bufferComandos.length 
@@ -448,6 +576,8 @@ ${'='.repeat(60)}
                 // Proxy de dados do servidor remoto para o cliente
                 realStream.on('data', (data) => {
                     stream.write(data);
+                    // Store terminal output for web interface
+                    stateManager.appendTerminalOutput(sessionId, data);
                 });
 
                 realStream.on('close', () => {
@@ -458,7 +588,7 @@ ${'='.repeat(60)}
                     });
                     stream.write('[z1GateKeeper] Conexão remota fechada.\r\n');
                     stream.end();
-                    activeConnections.delete(sessionId);
+                    stateManager.removeConnection(sessionId);
                 });
 
                 realStream.on('error', (err) => {
@@ -470,7 +600,7 @@ ${'='.repeat(60)}
             logError('DESTINATION_CONNECTION', err);
             stream.stderr.write(`[z1GateKeeper] Erro de conexão com destino: ${err.message}\r\n`);
             stream.end();
-            activeConnections.delete(sessionId);
+            stateManager.removeConnection(sessionId);
         }).connect(connectOptions);
     });
 
@@ -488,7 +618,7 @@ async function gracefulShutdown() {
 
     log('INFO', 'Iniciando shutdown graceful...');
     logAudit('SYSTEM', 'z1GateKeeper encerrando', { 
-        activeConnections: activeConnections.size 
+        activeConnections: stateManager.getActiveConnections().length 
     });
 
     // Fechar novas conexões
@@ -501,19 +631,27 @@ async function gracefulShutdown() {
     // Aguardar conexões ativas (com timeout)
     const maxWait = 30000; // 30 segundos
     const startWait = Date.now();
+    const activeCount = stateManager.getActiveConnections().length;
     
-    while (activeConnections.size > 0 && (Date.now() - startWait) < maxWait) {
+    while (activeCount > 0 && (Date.now() - startWait) < maxWait) {
         await new Promise(resolve => setTimeout(resolve, 1000));
-        log('INFO', `Aguardando ${activeConnections.size} conexão(ões) ativa(s)...`);
+        const currentCount = stateManager.getActiveConnections().length;
+        log('INFO', `Aguardando ${currentCount} conexão(ões) ativa(s)...`);
     }
 
-    if (activeConnections.size > 0) {
-        log('WARN', `Forçando encerramento de ${activeConnections.size} conexão(ões) ativa(s)`);
+    const finalCount = stateManager.getActiveConnections().length;
+    if (finalCount > 0) {
+        log('WARN', `Forçando encerramento de ${finalCount} conexão(ões) ativa(s)`);
     }
 
     // Fechar audit log
     if (auditLogStream) {
         auditLogStream.end();
+    }
+
+    // Fechar database
+    if (stateManager) {
+        stateManager.close();
     }
 
     // Fechar readline
@@ -657,3 +795,16 @@ const rl = readline.createInterface({
 
 initialize();
 startServer();
+
+// Start web interface if enabled
+if (CONFIG.web && CONFIG.web.enabled) {
+    const webServer = require('./web/server');
+    webServer.start(CONFIG.web, stateManager, ticketApprovalCallbacks);
+}
+
+// Export for web interface
+module.exports = {
+    stateManager,
+    ticketApprovalCallbacks,
+    CONFIG
+};

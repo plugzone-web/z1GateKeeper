@@ -18,6 +18,7 @@ O **z1GateKeeper** é um proxy SSH avançado que implementa um "Air-Gap Cognitiv
 - ✅ **Logging de Auditoria**: Registro completo de todas as operações
 - ✅ **Graceful Shutdown**: Encerramento seguro com preservação de conexões
 - ✅ **Multi-conexão**: Suporte a múltiplas sessões simultâneas
+- ✅ **Dashboard Web**: Interface web em tempo real para monitoramento e aprovação de tickets
 
 ## 🚀 Instalação
 
@@ -74,6 +75,33 @@ ssh usuario@proxy-ip -p 2222
 ```bash
 ssh usuario@proxy-ip -p 2222 -i id_z1_agent
 ```
+
+## 🌐 Dashboard Web
+
+O z1GateKeeper inclui um dashboard web para monitoramento em tempo real:
+
+1. **Tickets Pendentes**: Visualize e aprove/rejeite tickets de comandos bloqueados
+2. **Conexões Ativas**: Monitore todas as conexões SSH ativas
+3. **Histórico**: Navegue pelo histórico de conexões encerradas
+
+### Acesso
+
+Após habilitar no `config.json`, acesse:
+- `http://localhost:3000` (padrão)
+
+### Configuração
+
+```json
+{
+  "web": {
+    "enabled": true,
+    "port": 3000,
+    "host": "0.0.0.0"
+  }
+}
+```
+
+Veja `web/README.md` para mais detalhes.
 
 ## 📖 Como Funciona
 

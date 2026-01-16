@@ -53,6 +53,7 @@
         "echo"
     ],
     "screen": {
+        "enabled": false,
         "sessionName": "IA_BATCH_WORKSPACE"
     },
     "nhiDetection": {
@@ -69,5 +70,13 @@
     "auditLog": {
         "enabled": true,
         "path": "./logs/audit.log"
+    },
+    "web": {
+        "enabled": true,
+        "port": 3000,
+        "host": "0.0.0.0"
+    },
+    "database": {
+        "path": "./data/z1gatekeeper.db"
     }
 }
