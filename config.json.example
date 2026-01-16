@@ -1,0 +1,73 @@
+{
+    "proxy": {
+        "port": 2222,
+        "host": "0.0.0.0",
+        "hostKey": "./host.key",
+        "banner": "z1GateKeeper SSH Proxy - PluGzOne"
+    },
+    "destination": {
+        "host": "your-real-server.com",
+        "port": 22,
+        "username": "your-username",
+        "password": "your-password",
+        "privateKey": "./keys/destination_key",
+        "passphrase": "",
+        "readyTimeout": 20000
+    },
+    "allowedUsers": {
+        "plugzone": "a-secure-password",
+        "ai_agent_1": {
+            "password": "another-password",
+            "publicKeys": ["./keys/ai_agent_1.pub"]
+        },
+        "agent_bot": {
+            "publicKey": "./keys/agent_bot.pub"
+        }
+    },
+    "aiAuditor": {
+        "url": "http://localhost:11434/api/generate",
+        "model": "llama3:8b",
+        "timeout": 30000,
+        "headers": {},
+        "options": {}
+    },
+    "whitelist": [
+        "ls",
+        "cat",
+        "grep",
+        "pwd",
+        "find",
+        "stat",
+        "df",
+        "du",
+        "whoami",
+        "uname",
+        "top",
+        "htop",
+        "ps",
+        "head",
+        "tail",
+        "less",
+        "more",
+        "wc",
+        "echo"
+    ],
+    "screen": {
+        "sessionName": "IA_BATCH_WORKSPACE"
+    },
+    "nhiDetection": {
+        "enabled": true,
+        "patterns": [
+            "^ai_",
+            "^agent_",
+            "^bot_",
+            "_ai$",
+            "_agent$",
+            "_bot$"
+        ]
+    },
+    "auditLog": {
+        "enabled": true,
+        "path": "./logs/audit.log"
+    }
+}
